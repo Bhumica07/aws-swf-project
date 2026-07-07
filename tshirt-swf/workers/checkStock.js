@@ -1,13 +1,21 @@
 // workers/checkStock.js
-require('dotenv').config({ path: '../.env' });
+//require('dotenv').config({ path: '../.env' });
 const AWS = require('aws-sdk');
 const { updateStep } = require('../db');
 const config = require('../config');
 
-const credentials = new AWS.SharedIniFileCredentials({
-  profile: config.profile
+//#const credentials = new AWS.SharedIniFileCredentials({
+//#  profile: config.profile
+//#});
+//#AWS.config.credentials = credentials;
+
+AWS.config.update({
+  region: config.region,
+  credentials: new AWS.ECSCredentials({
+    httpOptions: { timeout: 5000 },
+    maxRetries: 10
+  })
 });
-AWS.config.credentials = credentials;
 
 const swf = new AWS.SWF({
   region: config.region

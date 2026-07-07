@@ -1,0 +1,3 @@
+# tshirt-swf/.dockerignore
+node_modules
+*.log

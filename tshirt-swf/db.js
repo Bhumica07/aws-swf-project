@@ -2,10 +2,18 @@
 const AWS = require('aws-sdk');
 const config = require('./config');
 
-const credentials = new AWS.SharedIniFileCredentials({
-  profile: config.profile
+//const credentials = new AWS.SharedIniFileCredentials({
+//  profile: config.profile
+//});
+//AWS.config.credentials = credentials;
+
+AWS.config.update({
+  region: config.region,
+  credentials: new AWS.ECSCredentials({
+    httpOptions: { timeout: 5000 },
+    maxRetries: 10
+  })
 });
-AWS.config.credentials = credentials;
 
 const dynamo = new AWS.DynamoDB.DocumentClient({
   region: config.region

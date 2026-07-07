@@ -1,0 +1,9 @@
+# dockerfile.chargePayment
+FROM --platform=linux/amd64 node:18-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY workers/ ./workers/
+COPY config.js .
+COPY db.js .
+CMD ["node", "workers/chargePayment.js"]

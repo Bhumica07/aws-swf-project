@@ -1,13 +1,22 @@
 // decider.js
-require('dotenv').config();
+//require('dotenv').config();
 const AWS = require('aws-sdk');
 const { completeOrder } = require('./db');
 const config = require('./config');
 
-const credentials = new AWS.SharedIniFileCredentials({
-  profile: config.profile
+// Use ECS task role credentials explicitly
+AWS.config.update({
+  region: config.region,
+  credentials: new AWS.ECSCredentials({
+    httpOptions: { timeout: 5000 },
+    maxRetries: 10
+  })
 });
-AWS.config.credentials = credentials;
+
+//#const credentials = new AWS.SharedIniFileCredentials({
+//#  profile: config.profile
+//#});
+//#AWS.config.credentials = credentials;
 
 const swf = new AWS.SWF({
   region: config.region
