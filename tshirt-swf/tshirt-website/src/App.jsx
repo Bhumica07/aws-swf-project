@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 
-const API = "https://3agxbo2hxh.execute-api.us-east-1.amazonaws.com/dev";
+const API = "https://x2o38rizq7.execute-api.us-east-1.amazonaws.com/dev";
 
 const STEPS = ["STARTED", "STOCK_CHECKED", "PAYMENT_CHARGED", "CONFIRMATION_SENT", "COMPLETED"];
 const STEP_LABELS = {
