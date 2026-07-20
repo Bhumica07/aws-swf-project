@@ -61,3 +61,318 @@
 
   The system handles planned shutdowns perfectly (rolling deploy, maintenance) but has zero protection for unplanned deaths (Spot reclaim, OOM crash) — and that's where clients lose calls.
 
+
+
+Voice Node Service — Implementation Plan
+
+ Context
+
+ Building a FastAPI-based Voice Node service for a test web application that handles plant delivery sampling. The app processes delivery steps and makes outbound calls to inform recipients of step completion.
+ Calls use AWS Polly (TTS) and Transcribe (STT), with DTMF handling for recipient actions.
+
+ The service runs on ECS with EC2 (later Spot instances). When a node drains (spot interruption), incomplete calls are NOT marked as done — they stay pending so the next ECS task retries with all original
+ parameters.
+
+ Project path: /Users/ssrivastava/voice-node
+
+ ---
+ Project Structure
+
+ voice-node/
+ ├── app/
+ │   ├── __init__.py
+ │   ├── main.py                 # FastAPI app, lifespan, mounts routers
+ │   ├── config.py               # Settings via pydantic-settings (AWS region, table name, etc.)
+ │   ├── routers/
+ │   │   ├── __init__.py
+ │   │   ├── health.py           # GET /health, GET /metrics
+ │   │   └── calls.py            # POST /call, POST /calls, POST /hangup, POST /drain
+ │   ├── services/
+ │   │   ├── __init__.py
+ │   │   ├── call_manager.py     # Core call orchestration (pick up tasks, make calls, handle DTMF)
+ │   │   ├── polly.py            # AWS Polly TTS synthesis
+ │   │   ├── transcribe.py       # AWS Transcribe streaming
+ │   │   └── dynamo.py           # DynamoDB operations (claim task, update status, query pending)
+ │   ├── models/
+ │   │   ├── __init__.py
+ │   │   └── schemas.py          # Pydantic models for requests/responses and call_tasks record
+ │   └── worker.py               # Background task poller (picks up pending_call tasks on startup)
+ ├── tests/
+ │   └── test_calls.py           # Basic endpoint tests
+ ├── Dockerfile
+ ├── requirements.txt
+ ├── docker-compose.yml          # Local dev (with DynamoDB Local)
+ └── README.md                   # Minimal: how to run locally, deploy to ECR/ECS
+
+ ---
+ Endpoints
+
+ ┌────────┬──────────┬──────────────────────────────────────────────────────────────────────────────────────┐
+ │ Method │   Path   │                                       Purpose                                        │
+ ├────────┼──────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ GET    │ /health  │ Liveness check (returns node_id, status, active call count)                          │
+ ├────────┼──────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ GET    │ /metrics │ Calls attempted, completed, failed, average duration                                 │
+ ├────────┼──────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ POST   │ /call    │ Manually trigger a single outbound call (for testing)                                │
+ ├────────┼──────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ POST   │ /calls   │ List/query active and pending call tasks                                             │
+ ├────────┼──────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ POST   │ /hangup  │ Force-terminate a specific call by task_id                                           │
+ ├────────┼──────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ POST   │ /drain   │ Graceful shutdown: stop claiming new tasks, let active calls finish or abandon, exit │
+ └────────┴──────────┴──────────────────────────────────────────────────────────────────────────────────────┘
+
+ ---
+ DynamoDB Table: call_tasks
+
+ ┌───────────────┬───────────────┬─────────────────────────────────────────────────────┐
+ │     Field     │     Type      │                       Purpose                       │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ task_id (PK)  │ String (UUID) │ Unique call task ID                                 │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ order_id      │ String        │ Links to plant delivery order                       │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ step          │ String        │ e.g. step_1_pickup_confirmed                        │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ phone_number  │ String        │ Recipient phone                                     │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ message       │ String        │ What to say via Polly TTS                           │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ dtmf_actions  │ Map           │ {"1": "confirm_received", "2": "reschedule"}        │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ status        │ String        │ pending_call / in_progress / informed / failed      │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ node_id       │ String        │ ECS task ID that owns this call (null when pending) │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ claimed_at    │ Number        │ Epoch timestamp when claimed (lease TTL)            │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ attempt_count │ Number        │ Retry counter                                       │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ created_at    │ String        │ ISO timestamp                                       │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ completed_at  │ String        │ ISO timestamp (set when informed)                   │
+ └───────────────┴───────────────┴─────────────────────────────────────────────────────┘
+
+ GSI1: status-index — PK: status, SK: claimed_at (query all pending_call, or stale in_progress)
+
+ ---
+ Call Flow Logic
+
+ 1. Web app completes a delivery step → writes to DynamoDB: {status: pending_call, message: "Step 1 complete...", dtmf_actions: {...}}
+ 2. Voice node worker polls for status=pending_call → claims via conditional UpdateItem (set node_id, status=in_progress, claimed_at=now)
+ 3. Call manager simulates outbound call:
+   - Calls Polly to synthesize the message
+   - "Plays" it (simulated — logs/emits event)
+   - Waits for DTMF (simulated — random or configurable response)
+   - If DTMF "1" → executes the mapped action
+ 4. On success: set status=informed, completed_at=now
+ 5. On drain (POST /drain):
+   - Set node to draining mode (stop picking new tasks)
+   - Active calls: let them finish if < 30s remaining, else just stop (status stays in_progress)
+     4. On success: set status=informed, completed_at=now
+     5. On drain (POST /drain):
+       - Set node to draining mode (stop picking new tasks)
+       - Active calls: let them finish if < 30s remaining, else just stop (status stays in_progress)
+       - Exit process
+     6. New ECS task starts:
+       - Worker queries for status=in_progress where claimed_at is older than lease timeout (e.g., 2 min)
+       - Reclaims those tasks → retries call from scratch with same params
+
+     ---
+     Key Implementation Details
+
+     - Lease-based ownership: claimed_at + 120s timeout. If a node dies without draining, the next node detects stale claims and retries.
+     - Simulation mode: No real SIP/telephony. Calls are simulated with delays and logged events. Polly/Transcribe are real AWS calls (or mocked via env flag SIMULATE_AWS=true for local dev).
+     - Background worker: asyncio task started in FastAPI lifespan, polls DynamoDB every 5s for pending tasks.
+     - Node ID: From ECS_CONTAINER_METADATA_URI_V4 in prod, or UUID in local dev.
+
+     ---
+     Dependencies (requirements.txt)
+
+     fastapi==0.115.*
+     uvicorn[standard]==0.34.*
+     pydantic-settings==2.*
+     boto3==1.35.*
+     aioboto3==13.*
+     httpx==0.28.*
+
+     ---
+     Dockerfile
+
+     - Base: python:3.12-slim
+     - Install requirements
+     - Copy app/
+     - Expose 8000
+     - CMD: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+     ---
+     Verification
+
+     1. docker-compose up — starts voice-node + DynamoDB Local
+     2. curl localhost:8000/health → 200 with node info
+     3. Insert a test call_task into DynamoDB Local → worker picks it up, simulates call, marks informed
+     4. Trigger /drain → verify node stops, task stays in_progress
+     5. Restart container → verify it reclaims the stale task and retries
+
+  Thought for 6s (ctrl+o to expand)
+
+--------------------
+
+
+Project Structure : 
+
+Voice Node Service — Implementation Plan
+
+ Context
+
+ Building a FastAPI-based Voice Node service for a test web application that handles plant delivery sampling. The app processes delivery steps and makes outbound calls to inform recipients of step completion.
+ Calls use AWS Polly (TTS) and Transcribe (STT), with DTMF handling for recipient actions.
+
+ The service runs on ECS with EC2 (later Spot instances). When a node drains (spot interruption), incomplete calls are NOT marked as done — they stay pending so the next ECS task retries with all original
+ parameters.
+
+ Project path: /Users/ssrivastava/voice-node
+
+ ---
+ Project Structure
+
+ voice-node/
+ ├── app/
+ │   ├── __init__.py
+ │   ├── main.py                 # FastAPI app, lifespan, mounts routers
+ │   ├── config.py               # Settings via pydantic-settings (AWS region, table name, etc.)
+ │   ├── routers/
+ │   │   ├── __init__.py
+ │   │   ├── health.py           # GET /health, GET /metrics
+ │   │   └── calls.py            # POST /call, POST /calls, POST /hangup, POST /drain
+ │   ├── services/
+ │   │   ├── __init__.py
+ │   │   ├── call_manager.py     # Core call orchestration (pick up tasks, make calls, handle DTMF)
+ │   │   ├── polly.py            # AWS Polly TTS synthesis
+ │   │   ├── transcribe.py       # AWS Transcribe streaming
+ │   │   └── dynamo.py           # DynamoDB operations (claim task, update status, query pending)
+ │   ├── models/
+ │   │   ├── __init__.py
+ │   │   └── schemas.py          # Pydantic models for requests/responses and call_tasks record
+ │   └── worker.py               # Background task poller (picks up pending_call tasks on startup)
+ ├── tests/
+ │   └── test_calls.py           # Basic endpoint tests
+ ├── Dockerfile
+ ├── requirements.txt
+ ├── docker-compose.yml          # Local dev (with DynamoDB Local)
+ └── README.md                   # Minimal: how to run locally, deploy to ECR/ECS
+
+ ---
+ Endpoints
+
+ ┌────────┬──────────┬──────────────────────────────────────────────────────────────────────────────────────┐
+ │ Method │   Path   │                                       Purpose                                        │
+ ├────────┼──────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ GET    │ /health  │ Liveness check (returns node_id, status, active call count)                          │
+ ├────────┼──────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ GET    │ /metrics │ Calls attempted, completed, failed, average duration                                 │
+ ├────────┼──────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ POST   │ /call    │ Manually trigger a single outbound call (for testing)                                │
+ ├────────┼──────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ POST   │ /calls   │ List/query active and pending call tasks                                             │
+ ├────────┼──────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ POST   │ /hangup  │ Force-terminate a specific call by task_id                                           │
+ ├────────┼──────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+ │ POST   │ /drain   │ Graceful shutdown: stop claiming new tasks, let active calls finish or abandon, exit │
+ └────────┴──────────┴──────────────────────────────────────────────────────────────────────────────────────┘
+
+ ---
+ DynamoDB Table: call_tasks
+
+ ┌───────────────┬───────────────┬─────────────────────────────────────────────────────┐
+ │     Field     │     Type      │                       Purpose                       │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ task_id (PK)  │ String (UUID) │ Unique call task ID                                 │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ order_id      │ String        │ Links to plant delivery order                       │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ step          │ String        │ e.g. step_1_pickup_confirmed                        │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ phone_number  │ String        │ Recipient phone                                     │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ message       │ String        │ What to say via Polly TTS                           │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ dtmf_actions  │ Map           │ {"1": "confirm_received", "2": "reschedule"}        │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ status        │ String        │ pending_call / in_progress / informed / failed      │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ node_id       │ String        │ ECS task ID that owns this call (null when pending) │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ claimed_at    │ Number        │ Epoch timestamp when claimed (lease TTL)            │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ attempt_count │ Number        │ Retry counter                                       │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ created_at    │ String        │ ISO timestamp                                       │
+ ├───────────────┼───────────────┼─────────────────────────────────────────────────────┤
+ │ completed_at  │ String        │ ISO timestamp (set when informed)                   │
+ └───────────────┴───────────────┴─────────────────────────────────────────────────────┘
+
+ GSI1: status-index — PK: status, SK: claimed_at (query all pending_call, or stale in_progress)
+
+ ---
+ Call Flow Logic
+
+ 1. Web app completes a delivery step → writes to DynamoDB: {status: pending_call, message: "Step 1 complete...", dtmf_actions: {...}}
+ 2. Voice node worker polls for status=pending_call → claims via conditional UpdateItem (set node_id, status=in_progress, claimed_at=now)
+ 3. Call manager simulates outbound call:
+   - Calls Polly to synthesize the message
+   - "Plays" it (simulated — logs/emits event)
+   - Waits for DTMF (simulated — random or configurable response)
+   - If DTMF "1" → executes the mapped action
+ 4. On success: set status=informed, completed_at=now
+ 5. On drain (POST /drain):
+   - Set node to draining mode (stop picking new tasks)
+   - Active calls: let them finish if < 30s remaining, else just stop (status stays in_progress)
+     4. On success: set status=informed, completed_at=now
+     5. On drain (POST /drain):
+       - Set node to draining mode (stop picking new tasks)
+       - Active calls: let them finish if < 30s remaining, else just stop (status stays in_progress)
+       - Exit process
+     6. New ECS task starts:
+       - Worker queries for status=in_progress where claimed_at is older than lease timeout (e.g., 2 min)
+       - Reclaims those tasks → retries call from scratch with same params
+
+     ---
+     Key Implementation Details
+
+     - Lease-based ownership: claimed_at + 120s timeout. If a node dies without draining, the next node detects stale claims and retries.
+     - Simulation mode: No real SIP/telephony. Calls are simulated with delays and logged events. Polly/Transcribe are real AWS calls (or mocked via env flag SIMULATE_AWS=true for local dev).
+     - Background worker: asyncio task started in FastAPI lifespan, polls DynamoDB every 5s for pending tasks.
+     - Node ID: From ECS_CONTAINER_METADATA_URI_V4 in prod, or UUID in local dev.
+
+     ---
+     Dependencies (requirements.txt)
+
+     fastapi==0.115.*
+     uvicorn[standard]==0.34.*
+     pydantic-settings==2.*
+     boto3==1.35.*
+     aioboto3==13.*
+     httpx==0.28.*
+
+     ---
+     Dockerfile
+
+     - Base: python:3.12-slim
+     - Install requirements
+     - Copy app/
+     - Expose 8000
+     - CMD: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+     ---
+     Verification
+
+     1. docker-compose up — starts voice-node + DynamoDB Local
+     2. curl localhost:8000/health → 200 with node info
+     3. Insert a test call_task into DynamoDB Local → worker picks it up, simulates call, marks informed
+     4. Trigger /drain → verify node stops, task stays in_progress
+     5. Restart container → verify it reclaims the stale task and retries
+
+  Thought for 6s (ctrl+o to expand)
+
