@@ -1,0 +1,63 @@
+⏺ How Voice-Node is Built
+
+  One ECS Task = One Complete Phone System:
+
+  ┌─────────────────────────────────────────────────┐
+  │           One Voice-Node Task                    │
+  │                                                  │
+  │  ┌─────────────┐  ┌────────────┐  ┌──────────┐ │
+  │  │ SIP Server  │  │ Controller │  │ Recorder │ │
+  │  │ (FreeSWITCH)│←→│ (Python)   │  │ (Java)   │ │
+  │  │             │  │            │  │          │ │
+  │  │ Makes/takes │  │ Brain -    │  │ Saves    │ │
+  │  │ phone calls │  │ decides    │  │ call     │ │
+  │  │             │  │ what to do │  │ audio    │ │
+  │  └─────────────┘  └────────────┘  └──────────┘ │
+  │                                                  │
+  │  Shared folder: /opt/ccs-voice                   │
+  │  All talk via localhost (host networking)         │
+  └─────────────────────────────────────────────────┘
+
+  Production runs 4 of these, spread across different availability zones.
+
+  ---
+  How Calls Work
+
+  1. Call comes in via NLB (Network Load Balancer) → hits one SIP server
+  2. SIP Server tells Controller "new call arrived"
+  3. Controller talks to Flows engine ("what script to run?"), speech services, chatbot, etc.
+  4. Controller keeps all call state in a Python dictionary in memory
+  5. When call ends, Controller writes CDR (call detail record) and done
+
+  ---
+  What's Designed Well
+
+  - Host networking — needed for 10,000 UDP ports (voice media)
+  - distinctInstance placement — each task gets its own EC2 box (no resource contention)
+  - 5400s stop timeout — during planned deploys, active calls get 1.5 hours to finish
+  - Health check (GET /check) — if FreeSWITCH dies, NLB stops sending traffic
+  - Graceful shutdown on SIGTERM — handles planned ECS rolling updates fine
+  - CloudWatch alarms — 4xx/5xx errors, unhealthy hosts → ServiceNow alerts
+
+  ---
+  What's Missing
+
+  ┌─────────────────────────────────────────────────────┬───────────────────────────────────────────────────────────────┐
+  │                         Gap                         │                        Why it matters                         │
+  ├─────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ No /drain endpoint                                  │ Nothing external can say "stop taking calls and save state"   │
+  ├─────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ Call state only in memory                           │ Server dies = all scheduled calls vanish forever              │
+  ├─────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ No Spot interruption handling                       │ AWS gives 2-min warning but nobody listens for it             │
+  ├─────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ No distinction: Spot vs On-Demand for stateful work │ Stateful voice tasks shouldn't be on interruptible instances  │
+  ├─────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ No auto-recovery for scheduled calls                │ Other nodes can't pick up what a dead node was supposed to do │
+  └─────────────────────────────────────────────────────┴───────────────────────────────────────────────────────────────┘
+
+  ---
+  The Gap in One Sentence
+
+  The system handles planned shutdowns perfectly (rolling deploy, maintenance) but has zero protection for unplanned deaths (Spot reclaim, OOM crash) — and that's where clients lose calls.
+
